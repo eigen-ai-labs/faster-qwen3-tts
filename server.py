@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -37,8 +38,9 @@ from urllib.parse import urlparse
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from faster_qwen3_tts import FasterQwen3TTS
@@ -53,6 +55,11 @@ VOICE_STORAGE_DIR = (_BASE_DIR / "voices").resolve()
 VOICE_DB_PATH = (_BASE_DIR / "data" / "voices.db").resolve()
 VOICE_S3_BUCKET = os.environ.get("VOICE_S3_BUCKET", "tts-voice-audio")
 VOICE_DB_S3_BUCKET = os.environ.get("VOICE_DB_S3_BUCKET", "tts-voice-id")
+
+FORMAT_CONTENT_TYPES = {
+    "wav": "audio/wav", "pcm": "audio/L16", "mp3": "audio/mpeg",
+    "flac": "audio/flac", "aac": "audio/aac", "opus": "audio/opus",
+}
 
 # ═══════════════════════════════════════════════════════════
 # Logging
@@ -232,6 +239,30 @@ def _chunk_to_pcm16(audio_chunk, sr: int) -> bytes:
     return _float_to_pcm16(wav)
 
 
+def _make_wav_header(pcm_len: int, sr: int = TARGET_SAMPLE_RATE, ch: int = 1, bits: int = 16) -> bytes:
+    br = sr * ch * bits // 8
+    ba = ch * bits // 8
+    h = struct.pack("<4sI4s", b"RIFF", 36 + pcm_len, b"WAVE")
+    h += struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, ch, sr, br, ba, bits)
+    h += struct.pack("<4sI", b"data", pcm_len)
+    return h
+
+
+def _encode_audio(pcm_bytes: bytes, fmt: str, sr: int = TARGET_SAMPLE_RATE) -> tuple[bytes, str]:
+    """Encode raw PCM16 bytes to the requested audio format. Returns (data, content_type)."""
+    if fmt == "pcm":
+        return pcm_bytes, "audio/L16"
+    if fmt == "wav":
+        return _make_wav_header(len(pcm_bytes), sr) + pcm_bytes, "audio/wav"
+    proc = subprocess.run(
+        ["ffmpeg", "-f", "s16le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", "-f", fmt, "pipe:1"],
+        input=pcm_bytes, capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg encoding to {fmt} failed")
+    return proc.stdout, FORMAT_CONTENT_TYPES.get(fmt, f"audio/{fmt}")
+
+
 # ═══════════════════════════════════════════════════════════
 # Model
 # ═══════════════════════════════════════════════════════════
@@ -367,6 +398,80 @@ async def _resolve_voice(payload: dict):
         voice = None
 
     return ref_audio, ref_text, voice, x_vector_only_mode, download_tmp
+
+
+# ═══════════════════════════════════════════════════════════
+# Request model & generation helpers
+# ═══════════════════════════════════════════════════════════
+
+class SpeechRequest(BaseModel):
+    text: str = None
+    input: str = None           # OpenAI-style alias
+    language: str = "Auto"
+    speaker: str = "Vivian"
+    voice: str = None           # OpenAI-style alias for speaker
+    model: str = None
+    response_format: str = "wav"
+    speed: float = 1.0          # accepted for API compat, not used
+    ref_audio: str = None
+    ref_text: str = None
+    x_vector_only_mode: bool = True
+    instructions: str = None
+
+
+async def _generate_full_pcm(
+    text: str,
+    language: str,
+    speaker: str,
+    ref_audio: str = None,
+    ref_text: str = "",
+    x_vector_only_mode: bool = True,
+    instructions: str = "",
+    download_tmp: str = None,
+) -> bytes:
+    """Non-streaming: collect all PCM16 bytes under the generation lock."""
+    def _run():
+        try:
+            if _model is None:
+                raise RuntimeError("Model not loaded")
+            model_type = _get_model_type()
+            chunk_size = 24
+            if model_type == "custom_voice":
+                gen = _model.generate_custom_voice_streaming(
+                    text=text, speaker=speaker or "Vivian", language=language,
+                    instruct=instructions or None, chunk_size=chunk_size,
+                )
+            elif model_type == "voice_design":
+                gen = _model.generate_voice_design_streaming(
+                    text=text, instruct=instructions or "", language=language,
+                    chunk_size=chunk_size,
+                )
+            else:
+                if not ref_audio:
+                    raise RuntimeError(
+                        "Base model requires a voice reference. "
+                        "Provide voice_id (from /upload_voice) or voice_url."
+                    )
+                gen = _model.generate_voice_clone_streaming(
+                    text=text, language=language, ref_audio=ref_audio,
+                    ref_text=ref_text or "", xvec_only=x_vector_only_mode,
+                    chunk_size=chunk_size,
+                )
+            all_pcm = bytearray()
+            for audio_chunk, sr, _timing in gen:
+                pcm = _chunk_to_pcm16(audio_chunk, sr)
+                if pcm:
+                    all_pcm.extend(pcm)
+            return bytes(all_pcm)
+        finally:
+            if download_tmp and os.path.exists(download_tmp):
+                try:
+                    os.remove(download_tmp)
+                except Exception:
+                    pass
+
+    async with _generation_lock:
+        return await asyncio.to_thread(_run)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -661,6 +766,116 @@ async def upload_voice(
                     pass
 
 
+@app.get("/v1/models")
+async def list_models():
+    return {"object": "list", "data": [{"id": _model_name(), "object": "model", "owned_by": "qwen"}]}
+
+
+@app.get("/v1/audio/voices")
+async def list_voices():
+    speakers = []
+    if _model is not None:
+        try:
+            speakers = _model.model.get_supported_speakers() or []
+        except Exception:
+            pass
+    return {"voices": speakers}
+
+
+@app.post("/v1/audio/speech")
+async def create_speech(req: SpeechRequest):
+    """Non-streaming TTS (OpenAI-compatible). Returns audio in requested format."""
+    text = req.text or req.input
+    if not text:
+        raise HTTPException(status_code=400, detail="text parameter required")
+    if _model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    speaker = req.voice or req.speaker
+    pcm_bytes = await _generate_full_pcm(
+        text=text, language=req.language, speaker=speaker,
+        ref_audio=req.ref_audio, ref_text=req.ref_text or "",
+        x_vector_only_mode=req.x_vector_only_mode,
+        instructions=req.instructions or "",
+    )
+    audio_bytes, ct = _encode_audio(pcm_bytes, req.response_format)
+    return Response(content=audio_bytes, media_type=ct,
+                    headers={"Sample-Rate": str(TARGET_SAMPLE_RATE)})
+
+
+@app.post("/v1/audio/speech/stream")
+async def create_speech_stream(req: SpeechRequest):
+    """Streaming TTS (OpenAI-compatible). Returns chunked PCM16 audio."""
+    text = req.text or req.input
+    if not text:
+        raise HTTPException(status_code=400, detail="text parameter required")
+    if _model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    speaker = req.voice or req.speaker
+    payload_dict = {
+        "text": text,
+        "language": req.language,
+        "instructions": req.instructions or "",
+        "chunk_size": 12,
+    }
+
+    async def _stream():
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        thread = threading.Thread(
+            target=_run_generation,
+            args=(payload_dict, loop, queue),
+            kwargs=dict(
+                ref_audio=req.ref_audio,
+                ref_text=req.ref_text or "",
+                speaker=speaker,
+                x_vector_only_mode=req.x_vector_only_mode,
+            ),
+            daemon=True,
+        )
+        async with _generation_lock:
+            thread.start()
+            try:
+                while True:
+                    item = await asyncio.wait_for(queue.get(), timeout=120)
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            except asyncio.TimeoutError:
+                logger.error("HTTP stream generation timeout")
+
+    return StreamingResponse(
+        _stream(),
+        media_type="audio/L16",
+        headers={"Sample-Rate": str(TARGET_SAMPLE_RATE)},
+    )
+
+
+@app.post("/v1/text-to-speech")
+async def text_to_speech(payload: dict = Body(...)):
+    """Non-streaming TTS with full voice resolution (voice_id, voice_url, voice_s3_key)."""
+    text = payload.get("text") or payload.get("input") or ""
+    if not text:
+        raise HTTPException(status_code=400, detail="text parameter required")
+    if _model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    ref_audio, ref_text, speaker, x_vector_only_mode, download_tmp = await _resolve_voice(payload)
+    language = payload.get("language", "Auto")
+    fmt = payload.get("response_format", "wav")
+    instructions = payload.get("instructions") or payload.get("instruct") or ""
+    pcm_bytes = await _generate_full_pcm(
+        text=text, language=language, speaker=speaker,
+        ref_audio=ref_audio, ref_text=ref_text,
+        x_vector_only_mode=x_vector_only_mode,
+        instructions=instructions,
+        download_tmp=download_tmp,
+    )
+    audio_bytes, ct = _encode_audio(pcm_bytes, fmt)
+    return Response(content=audio_bytes, media_type=ct,
+                    headers={"Sample-Rate": str(TARGET_SAMPLE_RATE)})
+
+
 @app.get("/")
 async def root():
     return {
@@ -668,9 +883,14 @@ async def root():
         "model": _model_name(),
         "model_type": _get_model_type(),
         "endpoints": [
-            "WS  /tts/ws",
-            "POST /upload_voice",
             "GET  /health",
+            "GET  /v1/models",
+            "GET  /v1/audio/voices",
+            "POST /v1/audio/speech",
+            "POST /v1/audio/speech/stream",
+            "POST /v1/text-to-speech",
+            "WS   /tts/ws",
+            "POST /upload_voice",
         ],
     }
 
